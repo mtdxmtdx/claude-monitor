@@ -1,0 +1,8 @@
+# Bridge 端
+node_modules/
+package-lock.json
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db

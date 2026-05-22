@@ -1,0 +1,17 @@
+include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    avoid_print: false
+    prefer_const_constructors: true
+    prefer_const_literals_to_create_immutables: true
+    use_key_in_widget_constructors: true
+
+analyzer:
+  errors:
+    # 项目允许 setState 在 build 过程中调用以外的同步流式写入
+    unused_import: warning
+    unused_local_variable: warning
+  exclude:
+    - build/**
+    - "**/*.g.dart"

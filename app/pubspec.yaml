@@ -1,0 +1,23 @@
+name: claude_monitor
+description: Claude Code 远程监控客户端
+
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^2.4.0   # WebSocket 客户端
+  xterm: ^4.0.0                # 终端渲染（支持 ANSI/VT100）
+  shared_preferences: ^2.2.0   # 持久化 IP 配置
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

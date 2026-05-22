@@ -1,0 +1,13 @@
+{
+  "name": "claude-code-bridge",
+  "version": "1.0.0",
+  "description": "WebSocket bridge for Claude Code CLI",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "ws": "^8.17.0"
+  }
+}
