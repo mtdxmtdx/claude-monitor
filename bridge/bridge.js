@@ -7,6 +7,8 @@
 const pty  = require('node-pty');
 const ws   = require('ws');
 const os   = require('os');
+const fs   = require('fs');
+const path = require('path');
 
 // ──────────────────────────────────────────────
 // 配置
@@ -14,6 +16,19 @@ const os   = require('os');
 const PORT       = 8765;
 const BUF_MAX    = 60_000;   // 历史缓冲上限（字节）
 const BUF_KEEP   = 36_000;   // 超限后保留的尾部大小
+
+// 目录搜索参数
+const SEARCH_MAX_DEPTH   = 4;
+const SEARCH_MAX_RESULTS = 200;
+const SEARCH_SKIP = new Set([
+  'node_modules', '.git', '.svn', '.hg', '.idea', '.vscode',
+  'AppData', '$RECYCLE.BIN', 'System Volume Information',
+  'Windows', 'Program Files', 'Program Files (x86)', 'ProgramData',
+  '.gradle', '.dart_tool', 'build', 'dist', '.next', '.cache',
+]);
+
+// 自定义根目录持久化
+const ROOTS_FILE = path.join(__dirname, 'roots.json');
 
 // ──────────────────────────────────────────────
 // 状态
@@ -37,6 +52,110 @@ function printAddresses() {
   });
   console.log(`║  端口: ${String(PORT).padEnd(22)} ║`);
   console.log('╚══════════════════════════════╝\n');
+}
+
+// ──────────────────────────────────────────────
+// 目录跳转：根目录管理
+// ──────────────────────────────────────────────
+function defaultRoots() {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const list = [];
+  const push = (label, p) => {
+    if (p && fs.existsSync(p)) list.push({ label, path: p, builtin: true });
+  };
+  push('主目录',  home);
+  push('桌面',    path.join(home, 'Desktop'));
+  push('文档',    path.join(home, 'Documents'));
+  push('下载',    path.join(home, 'Downloads'));
+  // Windows 盘符
+  if (process.platform === 'win32') {
+    for (const letter of 'CDEFGHIJ') {
+      const drv = `${letter}:\\`;
+      try { if (fs.existsSync(drv)) push(`${letter} 盘`, drv); } catch (_) {}
+    }
+  }
+  return list;
+}
+
+function loadCustomRoots() {
+  try {
+    const raw = fs.readFileSync(ROOTS_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter(r => r && r.path) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveCustomRoots(list) {
+  try {
+    fs.writeFileSync(ROOTS_FILE, JSON.stringify(list, null, 2), 'utf8');
+    return true;
+  } catch (e) {
+    console.error('[bridge] 保存自定义根目录失败:', e.message);
+    return false;
+  }
+}
+
+function listRoots() {
+  const custom = loadCustomRoots().map(r => ({ ...r, builtin: false }));
+  return [...defaultRoots(), ...custom];
+}
+
+function addCustomRoot(label, p) {
+  if (!p || !fs.existsSync(p)) return { ok: false, error: '路径不存在' };
+  const stat = fs.statSync(p);
+  if (!stat.isDirectory()) return { ok: false, error: '不是文件夹' };
+  const list = loadCustomRoots();
+  const norm = path.resolve(p);
+  if (list.some(r => path.resolve(r.path) === norm)) {
+    return { ok: false, error: '已存在' };
+  }
+  list.push({ label: label || path.basename(norm) || norm, path: norm });
+  return saveCustomRoots(list) ? { ok: true } : { ok: false, error: '写入失败' };
+}
+
+function removeCustomRoot(p) {
+  const norm = path.resolve(p);
+  const list = loadCustomRoots().filter(r => path.resolve(r.path) !== norm);
+  return saveCustomRoots(list);
+}
+
+// ──────────────────────────────────────────────
+// 目录跳转：按关键字搜索文件夹名
+// 在 root 下做受限 BFS，仅匹配文件夹名 contains keyword（不区分大小写）
+// ──────────────────────────────────────────────
+function searchDirs(root, keyword) {
+  const results = [];
+  if (!root || !fs.existsSync(root)) return results;
+  const kw = (keyword || '').trim().toLowerCase();
+  if (!kw) return results;
+
+  const queue = [{ dir: root, depth: 0 }];
+  while (queue.length && results.length < SEARCH_MAX_RESULTS) {
+    const { dir, depth } = queue.shift();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      continue;
+    }
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      const name = ent.name;
+      if (name.startsWith('.')) continue;
+      if (SEARCH_SKIP.has(name)) continue;
+      const full = path.join(dir, name);
+      if (name.toLowerCase().includes(kw)) {
+        results.push({ name, path: full });
+        if (results.length >= SEARCH_MAX_RESULTS) break;
+      }
+      if (depth + 1 < SEARCH_MAX_DEPTH) {
+        queue.push({ dir: full, depth: depth + 1 });
+      }
+    }
+  }
+  return results;
 }
 
 // ──────────────────────────────────────────────
@@ -104,27 +223,59 @@ server.on('connection', client => {
 
   // 接收来自 Android 的消息
   client.on('message', raw => {
-    try {
-      const msg = JSON.parse(raw);
-      if (!shell) return;
-      switch (msg.type) {
-        case 'input':
-          shell.write(msg.data);
-          break;
-        case 'resize':
-          shell.resize(
-            Math.max(1, Math.min(msg.cols, 250)),
-            Math.max(1, Math.min(msg.rows, 80))
-          );
-          break;
-        case 'kill':
-          shell.kill();
-          break;
-        case 'restart':
-          shell.kill();
-          break;
+    let msg;
+    try { msg = JSON.parse(raw); } catch (_) { return; }
+
+    // 目录跳转：不依赖 shell，单独处理
+    switch (msg.type) {
+      case 'list_roots':
+        client.send(JSON.stringify({
+          type: 'roots', reqId: msg.reqId, data: listRoots(),
+        }));
+        return;
+      case 'search_dirs': {
+        const data = searchDirs(msg.root, msg.keyword);
+        client.send(JSON.stringify({
+          type: 'search_result', reqId: msg.reqId, data,
+        }));
+        return;
       }
-    } catch (_) {}
+      case 'add_root': {
+        const r = addCustomRoot(msg.label, msg.path);
+        client.send(JSON.stringify({
+          type: 'root_changed', reqId: msg.reqId, ok: r.ok, error: r.error,
+          data: listRoots(),
+        }));
+        return;
+      }
+      case 'remove_root': {
+        const ok = removeCustomRoot(msg.path);
+        client.send(JSON.stringify({
+          type: 'root_changed', reqId: msg.reqId, ok, data: listRoots(),
+        }));
+        return;
+      }
+    }
+
+    // 其余消息需要 shell
+    if (!shell) return;
+    switch (msg.type) {
+      case 'input':
+        shell.write(msg.data);
+        break;
+      case 'resize':
+        shell.resize(
+          Math.max(1, Math.min(msg.cols, 250)),
+          Math.max(1, Math.min(msg.rows, 80))
+        );
+        break;
+      case 'kill':
+        shell.kill();
+        break;
+      case 'restart':
+        shell.kill();
+        break;
+    }
   });
 
   client.on('close', () => {

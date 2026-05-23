@@ -155,6 +155,10 @@ class _MonitorPageState extends State<MonitorPage> {
   bool _autoReconnect = false;
   int  _reconnectSec  = 0;
 
+  // 目录跳转：请求-响应配对
+  int _reqIdSeq = 0;
+  final Map<int, Completer<dynamic>> _pending = {};
+
   @override
   void initState() {
     super.initState();
@@ -252,8 +256,75 @@ class _MonitorPageState extends State<MonitorPage> {
           _terminal.write(msg['data'] as String);
         case 'exit':
           _terminal.write('\r\n\x1b[33m[claude 进程已退出 code=${msg['exitCode']}]\x1b[0m\r\n');
+        case 'roots':
+        case 'search_result':
+        case 'root_changed':
+          final id = msg['reqId'];
+          if (id is int) {
+            _pending.remove(id)?.complete(msg);
+          }
       }
     } catch (_) {}
+  }
+
+  // ── 目录跳转：请求封装 ────────────────────────
+  Future<Map?> _request(Map<String, dynamic> payload, {Duration timeout = const Duration(seconds: 15)}) {
+    if (_channel == null) return Future.value(null);
+    final id = ++_reqIdSeq;
+    final c = Completer<dynamic>();
+    _pending[id] = c;
+    _channel!.sink.add(jsonEncode({...payload, 'reqId': id}));
+    return c.future
+        .timeout(timeout, onTimeout: () { _pending.remove(id); return null; })
+        .then((v) => v is Map ? v : null);
+  }
+
+  Future<List<Map>> _fetchRoots() async {
+    final r = await _request({'type': 'list_roots'});
+    final data = r?['data'];
+    return data is List ? data.cast<Map>() : <Map>[];
+  }
+
+  Future<List<Map>> _searchDirs(String root, String keyword) async {
+    final r = await _request({'type': 'search_dirs', 'root': root, 'keyword': keyword});
+    final data = r?['data'];
+    return data is List ? data.cast<Map>() : <Map>[];
+  }
+
+  Future<Map?> _addRoot(String label, String path) =>
+      _request({'type': 'add_root', 'label': label, 'path': path});
+
+  Future<Map?> _removeRoot(String path) =>
+      _request({'type': 'remove_root', 'path': path});
+
+  void _jumpTo(String dirPath) {
+    final escaped = dirPath.replaceAll('"', r'\"');
+    _channel?.sink.add(jsonEncode({
+      'type': 'input',
+      'data': 'cd /d "$escaped"\r',
+    }));
+  }
+
+  Future<void> _openFolderPicker() async {
+    if (!_connected) return;
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: _surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+      ),
+      builder: (_) => _FolderPicker(
+        fetchRoots:  _fetchRoots,
+        searchDirs:  _searchDirs,
+        addRoot:     _addRoot,
+        removeRoot:  _removeRoot,
+        onPick: (p) {
+          _jumpTo(p);
+          Navigator.of(context).pop();
+        },
+      ),
+    );
   }
 
   void _onDisconnect() {
@@ -269,6 +340,10 @@ class _MonitorPageState extends State<MonitorPage> {
     _channel?.sink.close();
     _channel = null;
     _terminal.onOutput = null;
+    for (final c in _pending.values) {
+      if (!c.isCompleted) c.complete(null);
+    }
+    _pending.clear();
     if (notify) _terminal.write('\r\n\x1b[33m[已断开]\x1b[0m\r\n');
     if (mounted) {
       setState(() {
@@ -335,6 +410,13 @@ class _MonitorPageState extends State<MonitorPage> {
         ]),
         actions: [
           if (_connected) ...[
+            // 目录跳转
+            _AppBarBtn(
+              icon: Icons.folder_open_rounded,
+              color: _green,
+              tooltip: '跳转到文件夹',
+              onTap: _openFolderPicker,
+            ),
             // Ctrl+C
             _AppBarBtn(
               icon: Icons.stop_rounded,
@@ -678,6 +760,332 @@ class _KeyBtn extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+// ──────────────────────────────────────────────
+// 目录跳转：底部抽屉
+// ──────────────────────────────────────────────
+class _FolderPicker extends StatefulWidget {
+  final Future<List<Map>> Function() fetchRoots;
+  final Future<List<Map>> Function(String root, String keyword) searchDirs;
+  final Future<Map?> Function(String label, String path) addRoot;
+  final Future<Map?> Function(String path) removeRoot;
+  final ValueChanged<String> onPick;
+
+  const _FolderPicker({
+    required this.fetchRoots,
+    required this.searchDirs,
+    required this.addRoot,
+    required this.removeRoot,
+    required this.onPick,
+  });
+
+  @override
+  State<_FolderPicker> createState() => _FolderPickerState();
+}
+
+class _FolderPickerState extends State<_FolderPicker> {
+  final _kwCtrl = TextEditingController();
+  List<Map> _roots = [];
+  Map? _selectedRoot;
+  List<Map> _results = [];
+  bool _loadingRoots = true;
+  bool _searching = false;
+  Timer? _debounce;
+  int _searchSeq = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRoots();
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _kwCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadRoots() async {
+    setState(() => _loadingRoots = true);
+    final list = await widget.fetchRoots();
+    if (!mounted) return;
+    setState(() {
+      _roots = list;
+      _selectedRoot ??= list.isNotEmpty ? list.first : null;
+      _loadingRoots = false;
+    });
+  }
+
+  void _onKeywordChanged(String _) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 350), _runSearch);
+  }
+
+  Future<void> _runSearch() async {
+    final root = _selectedRoot?['path'] as String?;
+    final kw = _kwCtrl.text.trim();
+    if (root == null || kw.isEmpty) {
+      setState(() { _results = []; _searching = false; });
+      return;
+    }
+    final seq = ++_searchSeq;
+    setState(() => _searching = true);
+    final r = await widget.searchDirs(root, kw);
+    if (!mounted || seq != _searchSeq) return;
+    setState(() {
+      _results = r;
+      _searching = false;
+    });
+  }
+
+  Future<void> _promptAddRoot() async {
+    final labelCtrl = TextEditingController();
+    final pathCtrl  = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _surface,
+        title: const Text('添加常用目录', style: TextStyle(fontSize: 15, color: _textPri)),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(
+            controller: labelCtrl,
+            style: const TextStyle(color: _textPri, fontSize: 13),
+            decoration: const InputDecoration(hintText: '名称（如：项目）'),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: pathCtrl,
+            style: const TextStyle(color: _textPri, fontSize: 13, fontFamily: 'monospace'),
+            decoration: const InputDecoration(hintText: r'路径（如：D:\projects）'),
+          ),
+        ]),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消', style: TextStyle(color: _textSec)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('添加', style: TextStyle(color: _green)),
+          ),
+        ],
+      ),
+    );
+    labelCtrl.dispose();
+    if (ok != true) { pathCtrl.dispose(); return; }
+    final res = await widget.addRoot(labelCtrl.text.trim(), pathCtrl.text.trim());
+    pathCtrl.dispose();
+    if (!mounted) return;
+    if (res == null || res['ok'] != true) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: _surface2,
+        content: Text(
+          '添加失败: ${res?['error'] ?? '未知错误'}',
+          style: const TextStyle(color: _red, fontSize: 12),
+        ),
+      ));
+      return;
+    }
+    final list = (res['data'] as List?)?.cast<Map>() ?? [];
+    setState(() {
+      _roots = list;
+      // 选中刚添加的那个
+      _selectedRoot = list.lastWhere(
+        (r) => r['path'] == pathCtrl.text.trim(),
+        orElse: () => _selectedRoot ?? list.first,
+      );
+    });
+    _runSearch();
+  }
+
+  Future<void> _confirmRemoveRoot(Map root) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _surface,
+        title: const Text('删除该常用目录？', style: TextStyle(fontSize: 14, color: _textPri)),
+        content: Text(
+          '${root['label']}\n${root['path']}',
+          style: const TextStyle(fontSize: 12, color: _textSec, fontFamily: 'monospace'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消', style: TextStyle(color: _textSec)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除', style: TextStyle(color: _red)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final res = await widget.removeRoot(root['path'] as String);
+    if (!mounted || res == null) return;
+    final list = (res['data'] as List?)?.cast<Map>() ?? [];
+    setState(() {
+      _roots = list;
+      if (_selectedRoot != null && _selectedRoot!['path'] == root['path']) {
+        _selectedRoot = list.isNotEmpty ? list.first : null;
+        _results = [];
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    return Padding(
+      padding: EdgeInsets.only(bottom: media.viewInsets.bottom),
+      child: SizedBox(
+        height: media.size.height * 0.78,
+        child: Column(children: [
+          // 顶部抓手
+          Container(
+            margin: const EdgeInsets.only(top: 8, bottom: 4),
+            width: 36, height: 4,
+            decoration: BoxDecoration(
+              color: const Color(0xFF333333),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          // 标题栏
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 6, 6, 4),
+            child: Row(children: [
+              const Icon(Icons.folder_open_rounded, color: _green, size: 17),
+              const SizedBox(width: 8),
+              const Text('跳转到文件夹', style: TextStyle(fontSize: 14, color: _textPri, fontWeight: FontWeight.w500)),
+              const Spacer(),
+              IconButton(
+                tooltip: '添加常用目录',
+                icon: const Icon(Icons.add_rounded, color: _textSec, size: 20),
+                onPressed: _promptAddRoot,
+              ),
+            ]),
+          ),
+          // 根目录选择
+          if (_loadingRoots)
+            const Padding(
+              padding: EdgeInsets.all(20),
+              child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: _green)),
+            )
+          else
+            SizedBox(
+              height: 36,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                itemCount: _roots.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 6),
+                itemBuilder: (_, i) {
+                  final r = _roots[i];
+                  final sel = _selectedRoot != null && _selectedRoot!['path'] == r['path'];
+                  return GestureDetector(
+                    onTap: () {
+                      setState(() => _selectedRoot = r);
+                      _runSearch();
+                    },
+                    onLongPress: r['builtin'] == true ? null : () => _confirmRemoveRoot(r),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: sel ? _green : _surface2,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: sel ? _green : const Color(0xFF333333),
+                        ),
+                      ),
+                      child: Text(
+                        r['label']?.toString() ?? '',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                          color: sel ? Colors.black : _textPri,
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          const SizedBox(height: 8),
+          // 搜索框
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: TextField(
+              controller: _kwCtrl,
+              autofocus: true,
+              style: const TextStyle(fontSize: 13, color: _textPri),
+              decoration: InputDecoration(
+                hintText: '输入文件夹名关键字',
+                prefixIcon: const Icon(Icons.search_rounded, size: 18, color: _textSec),
+                suffixIcon: _searching
+                  ? const Padding(
+                      padding: EdgeInsets.all(10),
+                      child: SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: _green)),
+                    )
+                  : (_kwCtrl.text.isEmpty ? null : IconButton(
+                      icon: const Icon(Icons.close_rounded, size: 18, color: _textSec),
+                      onPressed: () { _kwCtrl.clear(); _runSearch(); },
+                    )),
+              ),
+              onChanged: _onKeywordChanged,
+              onSubmitted: (_) => _runSearch(),
+            ),
+          ),
+          const SizedBox(height: 6),
+          // 结果列表
+          Expanded(child: _buildResults()),
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildResults() {
+    if (_kwCtrl.text.trim().isEmpty) {
+      return const Center(
+        child: Text(
+          '在所选根目录下搜索文件夹名',
+          style: TextStyle(color: _textSec, fontSize: 12),
+        ),
+      );
+    }
+    if (_searching && _results.isEmpty) {
+      return const Center(child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: _green)));
+    }
+    if (_results.isEmpty) {
+      return const Center(
+        child: Text('未找到匹配的文件夹', style: TextStyle(color: _textSec, fontSize: 12)),
+      );
+    }
+    return ListView.separated(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      itemCount: _results.length,
+      separatorBuilder: (_, __) => const Divider(height: 1, color: Color(0xFF1F1F1F)),
+      itemBuilder: (_, i) {
+        final r = _results[i];
+        return ListTile(
+          dense: true,
+          visualDensity: VisualDensity.compact,
+          leading: const Icon(Icons.folder_rounded, color: _orange, size: 20),
+          title: Text(
+            r['name']?.toString() ?? '',
+            style: const TextStyle(fontSize: 13, color: _textPri),
+          ),
+          subtitle: Text(
+            r['path']?.toString() ?? '',
+            style: const TextStyle(fontSize: 11, color: _textSec, fontFamily: 'monospace'),
+            maxLines: 1, overflow: TextOverflow.ellipsis,
+          ),
+          onTap: () => widget.onPick(r['path'] as String),
+        );
+      },
     );
   }
 }
